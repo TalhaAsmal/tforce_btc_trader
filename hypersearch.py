@@ -41,7 +41,7 @@ def build_net_spec(hypers):
     """Builds an array of dicts that conform to TForce's network specification (see their docs) by mix-and-matching
     different network hypers
     """
-    net, indicators, arbitrage = Box(hypers['net']), hypers['indicators'], hypers['arbitrage']
+    net = Box(hypers['net'])
 
     dense = {
         'type': 'dense',
@@ -95,7 +95,7 @@ def build_net_spec(hypers):
 
         # This is just my hunch from CNNs I've seen; the filter sizes are much smaller than the downstream denses
         # (like 32-64-64 -> 512-256). If anyone has better intuition...
-        size = max([8, int(net.width // 5)])
+        size = max([32, int(net.width // 4)])
         # if i == 0: size = int(size / 2)  # Most convs have their first layer smaller... right? just the first, or what?
         arr.append({
             'size': size,
@@ -110,6 +110,10 @@ def build_net_spec(hypers):
     for i in range(net.depth_post):
         size = int(net.width / (i + 1)) if net.funnel else net.width
         arr.append({'size': size, **dense})
+        if net.dropout: arr.append({**dropout})
+
+    if net.extra_stationary:
+        arr.append({'size': 9, **dense})  # TODO fiddle with size? Found 9 from a book, seems legit.
         if net.dropout: arr.append({**dropout})
 
     return arr
@@ -144,9 +148,12 @@ def custom_net(hypers, print_net=False):
             # Apply stationary to the first Dense after the last LSTM. in the case of Baseline, there's no LSTM,
             # so apply it to the start
             apply_stationary_here = 0
-            # Find the last LSTM layer, peg to the next layer (a Dense)
             for i, layer in enumerate(self.layers):
-                if isinstance(layer, TForceLayers.InternalLstm) or isinstance(layer, TForceLayers.Flatten):
+                if hypers['net']['extra_stationary'] and isinstance(layer, TForceLayers.Dense):
+                    # Last Dense layer
+                    apply_stationary_here = i
+                elif isinstance(layer, TForceLayers.InternalLstm) or isinstance(layer, TForceLayers.Flatten):
+                    # Last LSTM layer, peg to the next layer (a Dense)
                     apply_stationary_here = i + 1
 
             next_internals = dict()
@@ -223,7 +230,7 @@ hypers['agent'] = {
 }
 hypers['memory_model'] = {
     'update_mode.unit': 'episodes',
-    'update_mode.batch_size': 8,  # {
+    'update_mode.batch_size': 4,  # {
         # 'type': 'bounded',
         # 'vals': [1, 10],
         # 'guess': 10,
@@ -231,14 +238,14 @@ hypers['memory_model'] = {
     # },
     'update_mode.frequency': {
         'type': 'bounded',
-        'vals': [1, 8],
-        'guess': 8,
+        'vals': [1, 4],
+        'guess': 4,
         'pre': round
     },
 
     'memory.type': 'latest',
     'memory.include_next_states': False,
-    'memory.capacity': 100000,  # {  TODO does this matter?
+    'memory.capacity': BitcoinEnv.EPISODE_LEN * 4,  # {
     #     'type': 'bounded',
     #     'vals': [2000, 20000],
     #     'guess': 5000
@@ -317,18 +324,39 @@ hypers['custom'] = {
     # Use a handful of TA-Lib technical indicators (SMA, EMA, RSI, etc). Which indicators used and for what time-frame
     # not optimally chosen at all; just figured "if some randos are better than nothing, there's something there and
     # I'll revisit". Help wanted.
-    'indicators': {
+    'indicators_count': {
+        'type': 'bounded',
+        'vals': [0, 5],
+        'guess': 3,
+        'pre': round
+    },
+    'indicators_window': {
         'type': 'bounded',
         'vals': [0, 600],
-        'guess': 600,
+        'guess': 300,
         'pre': int,
-        'hydrate': min_threshold(100, False)
     },
+
+    # This is special. "Risk arbitrage" is the idea of watching two exchanges for the same
+    # instrument's price. Let's say BTC is $10k in GDAX and $9k in Kraken. Well, Kraken is a smaller / less popular
+    # exchange, so it tends to play "follow the leader". Ie, Kraken will likely try to get to $10k
+    # to match GDAX (oversimplifying obviously). This is called "risk arbitrage" ("arbitrage"
+    # by itself is slightly different, not useful for us). Presumably that's golden info for the neural net:
+    # "Kraken < GDAX? Buy in Kraken!". It's not a gaurantee, so this is a hyper in hypersearch.py.
+    # Incidentally I have found it detrimental, I think due to imperfect time-phase alignment (arbitrage code in
+    # data.py) which makes it hard for the net to follow.
+    # Note: not valuable if GDAX is main (ie, not valuable if the bigger exchange is the main, only
+    # if the smaller exchange (eg Kraken) is main)
+    'arbitrage': {
+        'type': 'bool',
+        'guess': True
+    },
+
     # Conv / LSTM layers
     'net.depth_mid': {
         'type': 'bounded',
         'vals': [1, 3],
-        'guess': 2,
+        'guess': 3,
         'pre': round
     },
     # Dense layers
@@ -361,6 +389,14 @@ hypers['custom'] = {
         'guess': 'tanh'
     },
 
+    # Whether to append one extra tiny layer at the network's end for merging in the stationary data. This would give
+    # stationary data extra oomph. Currently, stationary (which is 2-3 features) gets merged in after flatten (in conv)
+    # which takes 256+ neurons, so stationary can easily get ignored without this hyper.
+    'net.extra_stationary': {
+        'type': 'bool',
+        'guess': True
+    },
+
     # Regularization: Dropout, L1, L2. You'd be surprised (or not) how important is the proper combo of these. The RL
     # papers just role L2 (.001) and ignore the other two; but that hasn't jived for me. Below is the best combo I've
     # gotten so far, and I'll update as I go.
@@ -384,7 +420,6 @@ hypers['custom'] = {
         'hydrate': min_ten_neg(1e-6, 0.)
     },
 
-
     # Instead of using absolute price diffs, use percent-change.
     'pct_change': {
         'type': 'bool',
@@ -396,35 +431,19 @@ hypers['custom'] = {
         'guess': True
     },
     # Scale the inputs and rewards
-    'scale': True,
-    # {
-    #     'type': 'bool',
-    #     'guess': True
-    # },
+    'scale': {
+        'type': 'bool',
+        'guess': True
+    },
 
     # After this many time-steps of doing the same thing we will terminate the episode and give the agent a huge
     # spanking. I didn't raise no investor, I raised a TRADER
     'punish_repeats': {
         'type': 'bounded',
-        'vals': [1000, 5000],
-        'guess': 5000,
+        'vals': [1000, BitcoinEnv.EPISODE_LEN * 1.5],  # more than ep len means don't punish
+        'guess': 1000,
         'pre': int
     },
-
-    # This is special. "Risk arbitrage" is the idea of watching two exchanges for the same
-    # instrument's price. Let's say BTC is $10k in GDAX and $9k in Kraken. Well, Kraken is a smaller / less popular
-    # exchange, so it tends to play "follow the leader". Ie, Kraken will likely try to get to $10k
-    # to match GDAX (oversimplifying obviously). This is called "risk arbitrage" ("arbitrage"
-    # by itself is slightly different, not useful for us). Presumably that's golden info for the neural net:
-    # "Kraken < GDAX? Buy in Kraken!". It's not a gaurantee, so this is a hyper in hypersearch.py.
-    # Incidentally I have found it detrimental, I think due to imperfect time-phase alignment (arbitrage code in
-    # data.py) which makes it hard for the net to follow.
-    # Note: not valuable if GDAX is main (ie, not valuable if the bigger exchange is the main, only
-    # if the smaller exchange (eg Kraken) is main)
-    'arbitrage': {
-        'type': 'bool',
-        'guess': True
-    }
 }
 
 hypers['lstm'] = {
@@ -582,27 +601,27 @@ class HSearchEnv(object):
         env.train_and_test(agent, self.cli_args.n_steps, self.cli_args.n_tests, -1)
 
         step_acc, ep_acc = env.acc.step, env.acc.episode
-        adv_avg = utils.calculate_score(ep_acc.advantages)
+        adv_avg = utils.calculate_score(ep_acc.sharpes)
         print(flat, f"\nAdvantage={adv_avg}\n\n")
 
         sql = """
-          insert into runs (hypers, advantage_avg, advantages, uniques, prices, actions, agent, flag) 
-          values (:hypers, :advantage_avg, :advantages, :uniques, :prices, :actions, :agent, :flag)
+          insert into runs (hypers, sharpes, returns, uniques, prices, signals, agent, flag) 
+          values (:hypers, :sharpes, :returns, :uniques, :prices, :signals, :agent, :flag)
           returning id;
         """
         row = self.conn_runs.execute(
             text(sql),
             hypers=json.dumps(flat),
-            advantage_avg=adv_avg,
-            advantages=list(ep_acc.advantages),
+            sharpes=list(ep_acc.sharpes),
+            returns=list(ep_acc.returns),
             uniques=list(ep_acc.uniques),
             prices=list(env.prices),
-            actions=list(step_acc.signals),
+            signals=list(step_acc.signals),
             agent=self.agent,
             flag=self.cli_args.net_type
         ).fetchone()
 
-        if ep_acc.advantages[-1] > 0:
+        if ep_acc.sharpes[-1] > 0:
             _id = str(row[0])
             directory = os.path.join(os.getcwd(), "saves", _id)
             filestar = os.path.join(directory, _id)
@@ -762,13 +781,13 @@ def main():
         # Every iteration, re-fetch from the database & pre-train new model. Acts same as saving/loading a model to disk,
         # but this allows to distribute across servers easily
         conn_runs = data.engine_runs.connect()
-        sql = "select hypers, advantages, advantage_avg from runs where flag=:f"
+        sql = "select hypers, sharpes from runs where flag=:f"
         runs = conn_runs.execute(text(sql), f=args.net_type).fetchall()
         conn_runs.close()
         X, Y = [], []
         for run in runs:
             X.append(hypers2vec(run.hypers))
-            Y.append([utils.calculate_score(run.advantages)])
+            Y.append([utils.calculate_score(run.sharpes)])
         boost_model = print_feature_importances(X, Y, feat_names)
 
         if args.guess != -1:
