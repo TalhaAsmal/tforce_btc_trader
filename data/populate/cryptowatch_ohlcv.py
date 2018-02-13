@@ -28,7 +28,8 @@ def fetch_market_and_save():
     try:
         res = dict(
             gdax=requests.get('https://api.cryptowat.ch/markets/gdax/btcusd/ohlc').json()['result'],
-            okcoin=requests.get('https://api.cryptowat.ch/markets/okcoin/btccny/ohlc').json()['result']
+            okcoin=requests.get('https://api.cryptowat.ch/markets/okcoin/btccny/ohlc').json()['result'],
+            bittrex=requests.get('https://api.cryptowat.ch/markets/bittrex/btcusdt/ohlc').json()['result']
         )
     except Exception as e:
         # raise Exception("Cryptowatch allowance out @{}".format(SLEEP))
@@ -57,7 +58,8 @@ i = 0
 while True:
     create_table_if_not_exists('gdax')
     create_table_if_not_exists('okcoin')
+    create_table_if_not_exists('bittrex')
     fetch_market_and_save()
-    print("ohlc.count: ", conn.execute("select count(*) from ohlc_gdax where period='60'").fetchone().count)
+    print("ohlc.count: ", conn.execute("select count(*) from ohlc_bittrex where period='60'").fetchone().count)
     time.sleep(SLEEP)
     i += 1

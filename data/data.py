@@ -23,8 +23,10 @@ engine_runs = create_engine(config_json['DB_RUNS'])
 class Exchange(Enum):
     GDAX = 'gdax'
     KRAKEN = 'kraken'
+    BITFINEX = 'bitfinex'
+    BITTREX = 'bittrex'  
 
-EXCHANGE = Exchange.KRAKEN
+EXCHANGE = Exchange.BITFINEX
 
 # Methods for imputing NaN. F=ffill, B=bfill, Z=zero. Generally we want volume/size-based features to be 0-filled
 # (indicating no trading during this blank period) and prices to ffill (maintain where the price left off). Right?
@@ -92,48 +94,14 @@ if 'alex' in DB or DB == 'dbk0cfbk3mfsb6':
 
 else:
     tables = [
-    {
-        'name': 'coinbase',
-        'ts': 'timestamp',
-        'cols': dict(
-            open=F,
-            high=F,
-            low=F,
-            close=F,
-            volume_btc=Z,
-            volume_currency=Z,
-            weighted_price=Z
-        ),
-        'ohlcv': dict(
-            open='open',
-            high='high',
-            low='low',
-            close='close',
-            volume='volume_currency'
-        )
-    },
-    {
-        'name': 'coincheck',
-        'ts': 'timestamp',
-        'cols': dict(
-            open=F,
-            high=F,
-            low=F,
-            close=F,
-            volume_btc=Z,
-            volume_currency=Z,
-            weighted_price=Z
-        ),
-        'ohlcv': dict(
-            open='open',
-            high='high',
-            low='low',
-            close='close',
-            volume='volume_currency'
-        )
-    }
+        {
+            'name': 'bitfinex',
+            'ts': 'timestamp',
+            'cols': dict(open=F, high=F, low=F, close=F, volume_btc=Z, volume_currency=Z),
+            'ohlcv': dict(open='open', high='high', low='low', close='close', volume='volume_currency')
+        }
     ]
-    target = 'coinbase_close'
+    target = 'bitfinex_close'
 
 
 def get_tables(arbitrage=True):

@@ -139,7 +139,7 @@ class BitcoinEnv(Environment):
         self.conn = data.engine.connect()
 
         # gdax min order size = .01btc; krakken = .002btc
-        self.min_trade = {Exchange.GDAX: .01, Exchange.KRAKEN: .002}[EXCHANGE]
+        self.min_trade = {Exchange.GDAX: .01, Exchange.KRAKEN: .002, Exchange.BITFINEX: 0.0025, Exchange.BITTREX: 0.0005}[EXCHANGE]
         self.update_btc_price()
 
         # Should be one scaler for any permutation of data (since the columns need to align exactly)
@@ -356,7 +356,9 @@ class BitcoinEnv(Environment):
 
         fee = {
             Exchange.GDAX: 0.0025,  # https://support.gdax.com/customer/en/portal/articles/2425097-what-are-the-fees-on-gdax-
-            Exchange.KRAKEN: 0.0026  # https://www.kraken.com/en-us/help/fees
+            Exchange.KRAKEN: 0.0026,  # https://www.kraken.com/en-us/help/fees
+            Exchange.BITFINEX: 0.002,  # https://www.bitfinex.com/fees
+            Exchange.BITTREX: 0.0025  # https://bittrex.com/fees
         }[EXCHANGE]
         reward = 0
         abs_sig = abs(signal)
