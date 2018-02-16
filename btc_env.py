@@ -105,11 +105,12 @@ scalers = {}
 class BitcoinEnv(Environment):
     EPISODE_LEN = 5000
 
-    def __init__(self, hypers, name='ppo_agent'):
+    def __init__(self, hypers, cli_args={}):
         """Initialize hyperparameters (done here instead of __init__ since OpenAI-Gym controls instantiation)"""
-        self.hypers = Box(hypers)
+        self.hypers = h = Box(hypers)
         self.conv2d = self.hypers['net.type'] == 'conv2d'
-        self.agent_name = name
+        self.all_or_none = self.hypers.action_type == 'all_or_none'
+        self.cli_args = cli_args
 
         # cash/val start @ about $3.5k each. You should increase/decrease depending on how much you'll put into your
         # exchange accounts to trade with. Presumably the agent will learn to work with what you've got (cash/value
@@ -135,18 +136,19 @@ class BitcoinEnv(Environment):
         self.mode = Mode.TRAIN
         self.conn = data.engine.connect()
 
+
         # gdax min order size = .01btc; krakken = .002btc
         self.min_trade = {Exchange.GDAX: .01, Exchange.KRAKEN: .002, Exchange.BITFINEX: 0.0025, Exchange.BITTREX: 0.0005}[EXCHANGE]
         self.update_btc_price()
 
         # Should be one scaler for any permutation of data (since the columns need to align exactly)
-        scaler_k = f'{self.hypers.arbitrage}|{self.hypers.indicators_count}|{self.hypers.repeat_last_state}'
+        scaler_k = f'{h.arbitrage}|{h.indicators_count}|{h.repeat_last_state}|{h.action_type}'
         if scaler_k not in scalers:
             scalers[scaler_k] = Scaler()
         self.scaler = scalers[scaler_k]
 
         # Our data is too high-dimensional for the way MemoryModel handles batched episodes. Reduce it (don't like this)
-        all_data = data.db_to_dataframe(self.conn, arbitrage=self.hypers.arbitrage)
+        all_data = data.db_to_dataframe(self.conn, arbitrage=h.arbitrage)
         self.all_observations, self.all_prices = self.xform_data(all_data)
         self.all_prices_diff = self.diff(self.all_prices, percent=True)
 
@@ -156,28 +158,31 @@ class BitcoinEnv(Environment):
 
         # Action space
         trade_cap = self.min_trade * 2  # not necessary to limit it like this, doing for my own sanity in live-mode
-        if self.hypers.single_action:
+        if h.action_type == 'single':
             # In single_action we discard any vals b/w [-min_trade, +min_trade] and call it "hold" (in execute())
             self.actions_ = dict(type='float', shape=(), min_value=-trade_cap, max_value=trade_cap)
-        else:
+        elif h.action_type == 'multi':
             # In multi-modal, hold is an actual action (in which case we discard "amount")
             self.actions_ = dict(
                 action=dict(type='int', shape=(), num_actions=3),
                 amount=dict(type='float', shape=(), min_value=self.min_trade, max_value=trade_cap))
+        elif h.action_type == 'all_or_none':
+            self.actions_ = dict(type='int', shape=(), num_actions=3)
 
         # Observation space
+        stationary_ct = 1 if self.all_or_none else 2
         self.cols_ = self.all_observations.shape[1]
         self.states_ = dict(
             series=dict(type='float', shape=self.cols_),  # all state values that are time-ish
-            stationary=dict(type='float', shape=3)  # everything that doesn't care about time (cash, value, n_repeats)
+            stationary=dict(type='float', shape=stationary_ct)  # everything that doesn't care about time
         )
 
         if self.conv2d:
             # width = step-window (150 time-steps)
             # height = nothing (1)
             # channels = features/inputs (price actions, OHCLV, etc).
-            self.states_['series']['shape'] = (self.hypers.step_window, 1, self.cols_)
-            if self.hypers.repeat_last_state:
+            self.states_['series']['shape'] = (h.step_window, 1, self.cols_)
+            if h.repeat_last_state:
                 self.states_['stationary']['shape'] += self.cols_
 
     def __str__(self): return 'BitcoinEnv'
@@ -255,12 +260,13 @@ class BitcoinEnv(Environment):
         if self.hypers.scale:
             states = robust_scale(states, quantile_range=(5., 95.))
 
-        # Currently we're reducing the dimensionality of our states (OHLCV + indicators + arbitrage => 5 or 6 weights)
+        # Reducing the dimensionality of our states (OHLCV + indicators + arbitrage => 5 or 6 weights)
         # because TensorForce's memory branch changed Policy Gradient models' batching from timesteps to episodes.
         # This takes of way too much GPU RAM for us, so we had to cut back in quite a few areas (num steps to train
-        # per episode, episode batch_size, and especially this:
-        # ae = AutoEncoder()
-        # states = ae.fit_transform_tied(states)
+        # per episode, episode batch_size, and especially states:
+        if self.cli_args.autoencode:
+            ae = AutoEncoder()
+            states = ae.fit_transform_tied(states)
 
         return states, prices
 
@@ -285,7 +291,7 @@ class BitcoinEnv(Environment):
             n_train, n_test = int(row_ct * split), int(row_ct * (1 - split))
             if mode == mode.TEST:
                 offset = n_train
-                limit = 40000 if full_set else 8000  # should be `n_test` in full_set, getting idx errors
+                limit = 40000 if full_set else 10000  # should be `n_test` in full_set, getting idx errors
             else:
                 # Grab a random window from the 90% training data. The random bit is important so the agent
                 # sees a variety of data. The window-size bit is a hack: as long as the agent doesn't die (doesn't cause
@@ -299,10 +305,9 @@ class BitcoinEnv(Environment):
         self.prices = self.all_prices[offset:offset+limit]
         self.prices_diff = self.all_prices_diff[offset:offset+limit]
 
-    def get_next_state(self, i, cash, value, repeats):
+    def get_next_state(self, i, stationary):
         i = i + self.offset
         series = self.all_observations[i]
-        stationary = [cash, value, repeats]
         if self.hypers.scale:
             # series already scaled in self._xform_data()
             stationary = self.scaler.transform(stationary, Scaler.STATIONARY).tolist()
@@ -327,15 +332,20 @@ class BitcoinEnv(Environment):
             hold=[self.start_cash + self.start_value]
         )
         step_acc.signals = []
-        step_acc.repeats = 0
+        if self.all_or_none:
+            step_acc.last_action = 1
         ep_acc.i += 1
 
-        return self.get_next_state(0, self.start_cash, self.start_value, 0.)
+        stationary = [step_acc.last_action] if self.all_or_none else [self.start_cash, self.start_value]
+        return self.get_next_state(0, stationary)
 
     def execute(self, actions):
-        if self.hypers.single_action:
+        step_acc, ep_acc = self.acc.step, self.acc.episode
+        h = self.hypers
+
+        if h.action_type == 'single':
             signal = 0 if -self.min_trade < actions < self.min_trade else actions
-        else:
+        elif h.action_type == 'multi':
             # Two actions: `action` (buy/sell/hold) and `amount` (how much)
             signal = {
                 0: -1,  # make amount negative
@@ -344,8 +354,12 @@ class BitcoinEnv(Environment):
             }[actions['action']] * actions['amount']
             if not signal: signal = 0  # sometimes gives -0.0, dunno if that matters anywhere downstream
             # multi-action min_trade accounted for in constructor
-
-        step_acc, ep_acc = self.acc.step, self.acc.episode
+        elif h.action_type == 'all_or_none':
+            signal = {
+                0: -step_acc.value,  # sell-all
+                1: 0,  # hold
+                2: step_acc.cash  # buy-all
+            }[actions]
 
         step_acc.signals.append(float(signal))
 
@@ -360,12 +374,23 @@ class BitcoinEnv(Environment):
         total_before = step_acc.cash + step_acc.value
         # Perform the trade. In training mode, we'll let it dip into negative here, but then kill and punish below.
         # In testing/live, we'll just block the trade if they can't afford it
-        if signal > 0 and abs_sig <= step_acc.cash:
-            step_acc.value += abs_sig - abs_sig*fee
-            step_acc.cash -= abs_sig
-        elif signal < 0 and abs_sig <= step_acc.value:
-            step_acc.cash += abs_sig - abs_sig*fee
-            step_acc.value -= abs_sig
+        if signal > 0:
+            if abs_sig <= step_acc.cash:
+                step_acc.value += abs_sig - abs_sig*fee
+                step_acc.cash -= abs_sig
+            else:
+                reward -= self.possible_reward
+        elif signal < 0:
+            if abs_sig <= step_acc.value:
+                step_acc.cash += abs_sig - abs_sig*fee
+                step_acc.value -= abs_sig
+            else:
+                reward -= self.possible_reward
+
+        # teach it to not to do something it can't do (doesn't matter too much since we can just block the trade, but
+        # hey - nicer if he "knows")
+        if self.all_or_none and step_acc.last_action == actions and actions != 1:  # if buy->buy or sell->sell
+            reward -= self.possible_reward
 
         # next delta. [1,2,2].pct_change() == [NaN, 1, 0]
         pct_change = self.prices_diff[step_acc.i + 1]
@@ -373,37 +398,44 @@ class BitcoinEnv(Environment):
         step_acc.value += pct_change * step_acc.value
         total_now = step_acc.value + step_acc.cash
         step_acc.totals.trade.append(total_now)
-        # Reward is in dollar-change. As we build a great portfolio, the reward should get bigger and bigger (and
-        # the agent should notice this)
-        reward += (total_now - total_before)
 
         # calculate what the reward would be "if I held", to calculate the actual reward's _advantage_ over holding
-        step_acc.hold_value += pct_change * step_acc.hold_value
+        hold_before = step_acc.hold_value
+        step_acc.hold_value += pct_change * hold_before
         step_acc.totals.hold.append(step_acc.hold_value + self.start_cash)
 
-        # Collect repeated same-action count (homogeneous actions punished below)
-        recent_actions = np.array(step_acc.signals[-step_acc.repeats:])
-        if np.any(recent_actions > 0) and np.any(recent_actions < 0) and np.any(recent_actions == 0):
-            step_acc.repeats = 0  # reset repeat counter
-        elif self.hypers.punish_repeats < self.EPISODE_LEN:
-            step_acc.repeats += 1
-            # by the time we hit punish_repeats, we're doubling punishments / canceling rewards. Note: we don't want to
-            # multiply by `reward` here because repeats are often 0, which means 0 penalty. Hence `possible_reward`
-            repeat_penalty = self.possible_reward * (step_acc.repeats / self.hypers.punish_repeats)
-            reward -= repeat_penalty
-            # step_acc.value -= repeat_penalty  # TMP: experimenting w/ showing the human & BO
+        # Reward is in dollar-change. As we build a great portfolio, the reward should get bigger and bigger (and
+        # the agent should notice this)
+        if h.reward_type == 'raw':
+            reward += (total_now - total_before)
+        elif h.reward_type == 'advantage':
+            reward += (total_now - total_before) - (step_acc.hold_value - hold_before)
+        elif h.reward_type == 'sharpe':
+            # don't tally individual trade rewards for sharpe, it's calculated at the end and passed-back to all
+            # steps via discount=1. We do want the other penalties above though
+            pass
 
         step_acc.i += 1
         ep_acc.total_steps += 1
 
-        next_state = self.get_next_state(step_acc.i, step_acc.cash, step_acc.value, step_acc.repeats)
-        if self.hypers.scale:
+        stationary = [step_acc.last_action] if self.all_or_none else [step_acc.cash, step_acc.value]
+        next_state = self.get_next_state(step_acc.i, stationary)
+        if h.scale:
             reward = self.scaler.transform([reward], Scaler.REWARD)[0]
+
+        # if h.reward_type == 'sharpe': reward = 0
 
         terminal = int(step_acc.i + 1 >= self.limit)
         if terminal and self.mode in (Mode.TRAIN, Mode.TEST):
             # We're done.
             step_acc.signals.append(0)  # Add one last signal (to match length)
+            if h.reward_type == 'sharpe':
+                diff = (pd.Series(step_acc.totals.trade).pct_change() - pd.Series(step_acc.totals.hold).pct_change())[1:]
+                mean, std = diff.mean(), diff.std()
+                if (std, mean) != (0, 0):
+                    reward += mean / std
+
+
         if terminal and self.mode in (Mode.LIVE, Mode.TEST_LIVE):
             # Only do real buy/sell on last step if LIVE (in case there are multiple steps b/w, we only care about
             # present). Then we unset terminal, after we fetch some new data (keep going)
@@ -461,7 +493,7 @@ class BitcoinEnv(Environment):
             if signal != 0:
                 print(f"New Total: {step_acc.cash + step_acc.value}")
                 self.episode_finished(None)  # Fixme refactor, awkward function to call here
-            next_state['stationary'] = [step_acc.cash, step_acc.value, step_acc.repeats]
+            next_state['stationary'] = [step_acc.cash, step_acc.value]
             terminal = False
 
         # if step_acc.value <= 0 or step_acc.cash <= 0: terminal = 1
@@ -480,7 +512,8 @@ class BitcoinEnv(Environment):
             # Usually Sharpe has `sqrt(num_trades)` in front (or `num_trading_days`?). Experimenting being creative w/
             # trade-diversity, etc. Give Sharpe some extra info
             # breadth = math.sqrt(np.uniques(signals))
-            breadth = np.std([np.sign(x) for x in signals])  # get signal direction, amount not as important (and adds complications)
+            # breadth = np.std([np.sign(x) for x in signals])  # get signal direction, amount not as important (and adds complications)
+            breadth = 1
             sharpe = breadth * (mean / std)
 
         cumm_ret = (totals.trade[-1] / totals.trade[0] - 1) - (totals.hold[-1] / totals.hold[0] - 1)
