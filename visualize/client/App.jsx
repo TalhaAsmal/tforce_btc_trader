@@ -23,13 +23,12 @@ class App extends Component {
   componentDidMount() {
     fetch('http://localhost:5000').then(res => res.json()).then(data => {
       data.forEach(d => {
-        d.reward_avg = d.advantage_avg
         d.hypers = _.transform(d.hypers, (m,v,k) => {
           m[k.replace(/\./g, '_')] = typeof v == 'boolean' ? ~~v : v;
         });
-        d.unique_sigs = _.uniq(d.actions).length;
+        d.unique_sigs = _.uniq(d.signals).length;
       });
-      this.orig_data = data;
+      this.forceRerender = true;
       this.setState({data});
     });
   }
@@ -51,7 +50,8 @@ class App extends Component {
   componentDidUpdate(prevProps, prevState) {
     // Re-mount charts if we changed page, pageSize, or filter
     let { page, pageSize, filter } = this.state;
-    if (prevState.page !== page || prevState.pageSize !== pageSize || prevState.filter !== filter) {
+    if (this.forceRerender || prevState.page !== page || prevState.pageSize !== pageSize || prevState.filter !== filter) {
+      this.forceRerender = false;
       const { page, pageSize } = this.state;
       let data = this.refs.reactTable.state.sortedData;
       let paged = data.slice(page*pageSize, page*pageSize+pageSize);
@@ -130,6 +130,12 @@ class App extends Component {
     );
   }
 
+  clickRun = d => {
+    // [0].parent for line, d.parent for dot
+    this.clickedDatum = _.get(d, '[0].parent', d.parent);
+    this.setState({showSignals: true}, this.mountSignals);
+  };
+
   mountChart = (data) => {
     let svg = d3.select("svg#rewards"),
       margin = {top: 20, right: 20, bottom: 30, left: 50},
@@ -139,7 +145,7 @@ class App extends Component {
     svg.select('g').remove(); // start clean
     let g = svg.append("g").attr("transform", "translate(" + margin.left + "," + margin.top + ")");
 
-    let rewards = data.map(d => d.advantages.map((v,i) => {
+    let rewards = data.map(d => d.sharpes.map((v,i) => {
       let y = v; // just human
       // let y = (d.rewards_agent[i] + v)/2; // human-agent average
       // y = _.clamp(y, -100, 100); // clamp so we don't break the graph
@@ -195,10 +201,7 @@ class App extends Component {
         .attr("stroke-linejoin", "round")
         .attr("stroke-linecap", "round")
         .attr("d", line)
-        .on("click", d => {
-          this.clickedDatum = d[0].parent;
-          this.setState({showSignals: true}, this.mountSignals);
-        })
+        .on("click", this.clickRun)
     });
 
     // Add a 0-line
@@ -244,6 +247,7 @@ class App extends Component {
         .attr("cy", d => y(d.y))
         .on("mouseover", tip.show)
         .on("mouseout", tip.hide)
+        .on("click", this.clickRun)
 
     let zoom = d3.zoom()
       .scaleExtent([0,500])
@@ -263,11 +267,11 @@ class App extends Component {
 
   mountSignals = () => {
     const {id} = this.clickedDatum;
-    fetch(`http://localhost:5000/actions/${id}`).then(res => res.json()).then(this._mountSignals);
+    fetch(`http://localhost:5000/signals/${id}`).then(res => res.json()).then(this._mountSignals);
   };
 
   _mountSignals = (data) => {
-    let {actions, prices} = data;
+    let {signals, prices} = data;
 
     let svg = d3.select("svg#signals");
     svg.select('g').remove(); // start fresh
@@ -320,8 +324,8 @@ class App extends Component {
       .enter()
         .append("circle")
         .classed('dot', true)
-        .style('fill', (d,i) => actions[i] < 0 ? 'red' : actions[i] > 0 ? 'green' : 'rgba(0,0,0,0)')
-        .attr("r", 2)
+        .style('fill', (d,i) => signals[i] < 0 ? 'red' : signals[i] > 0 ? 'green' : 'rgba(0,0,0,0)')
+        .attr("r", 1)
         .attr("cx", (d,i) => x(i))
         .attr("cy", d => y(d));
     let zoom = d3.zoom()
