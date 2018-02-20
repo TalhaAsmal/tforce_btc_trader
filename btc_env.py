@@ -316,12 +316,14 @@ class BitcoinEnv(Environment):
             # save away for now so we can keep transforming it as we add new data (find a more efficient way)
             self.df = df
         else:
-            row_ct = data.count_rows(self.conn, arbitrage=self.hypers.arbitrage)
+            # row_ct = data.count_rows(self.conn, arbitrage=self.hypers.arbitrage)
+            row_ct = self.all_prices.size
             split = .9  # Using 90% training data.
             n_train, n_test = int(row_ct * split), int(row_ct * (1 - split))
             if mode == mode.TEST:
                 offset = n_train
-                limit = 40000 if full_set else 10000  # should be `n_test` in full_set, getting idx errors
+                # limit = 40000 if full_set else 10000  # should be `n_test` in full_set, getting idx errors
+                limit = n_test
             else:
                 # Grab a random window from the 90% training data. The random bit is important so the agent
                 # sees a variety of data. The window-size bit is a hack: as long as the agent doesn't die (doesn't cause
